@@ -25,8 +25,6 @@ jobs:
     runs-on: ${{ matrix.arch.runner }}
     container:
       image: ${{ matrix.arch.image }}
-      volumes:
-        - /tmp/node20:/__e/node20
     env:
       ANDROID_ROOT: /system
       ANDROID_DATA: /data
@@ -41,11 +39,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Termux environment
+      - name: Install dependencies
         run: |
           ln -sf ${PREFIX}/etc/termux/mirrors/default ${PREFIX}/etc/termux/chosen_mirrors
           /entrypoint.sh bash -c "yes | pkg upgrade -y"
           chmod -R o+x ${PREFIX}/bin
+          /entrypoint.sh pkg install -y nodejs-lts
+          ln -sf ${PREFIX}/bin /__e/node20/bin
 
       - name: Build Lua
         run: |
