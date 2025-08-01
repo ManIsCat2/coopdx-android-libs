@@ -85,3 +85,14 @@ jobs:
         with:
           name: libjuice-${{ matrix.arch.name }}
           path: libjuice/*.a
+  
+      - name: Build Coopnet
+        run: |
+          cd coopnet
+          /entrypoint.sh make lib ANDROID_BUILD=1 -j8
+
+      - name: Upload Coopnet artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libcoopnet-${{ matrix.arch.name }}
+          path: coopnet/bin/*.a
