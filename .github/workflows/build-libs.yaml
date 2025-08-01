@@ -50,6 +50,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Reset permissions
+        run: chown -R 1000:1000 .
+
       - name: Build Lua
         run: |
           cd lua
