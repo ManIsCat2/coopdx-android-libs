@@ -63,10 +63,10 @@ else
     DYNLIB_NAME := libcoopnet.dylib
     LIBS := -l juice.1.6.2
     LDFLAGS += -rpath . -dynamiclib -install_name @rpath/$(DYNLIB_NAME)
-else ifeq ($(ANDROID_BUILD),1)
-  CXXFLAGS += -DANDROID_BUILD=1 -DTARGET_ANDROID=1
-  LIB_DIR := ./lib/android/$(ARCH_APK)
-else
+  else ifeq ($(ANDROID_BUILD),1)
+    CXXFLAGS += -DANDROID_BUILD=1 -DTARGET_ANDROID=1
+    LIB_DIR := ./lib/android/$(ARCH_APK)
+  else
     CXXFLAGS += -Wno-nonnull-compare
     LIB_DIR := lib/linux
   endif
