@@ -1,9 +1,18 @@
+#ifdef OSX_BUILD
+#include <mach-o/dyld.h>
+#endif
+
 #include <stdexcept>
 #include <string>
 #include <ctime>
 #include <fstream>
 #include <filesystem>
 #include "socket.hpp"
+
+#if defined(__APPLE__)
+// for _NSGetExecutablePath
+#include <mach-o/dyld.h>
+#endif
 
 // Convert a domain name to an in_addr using gethostbyname
 in_addr_t GetAddrFromDomain(const std::string& domain) {
@@ -55,7 +64,7 @@ std::string getExecutablePath() {
         return std::string(path);
     }
 #elif defined(__linux__)
-    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1); //returns path to libmain.so on android
+    ssize_t len = readlink("/proc/self/exe", path, sizeof(path) - 1);
     if (len != -1) {
         path[len] = '\0';
         return std::string(path);

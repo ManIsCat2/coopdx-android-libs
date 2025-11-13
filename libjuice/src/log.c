@@ -33,7 +33,7 @@ static const char *log_level_colors[] = {
 
 static mutex_t log_mutex = MUTEX_INITIALIZER;
 static volatile juice_log_cb_t log_cb = NULL;
-static atomic(juice_log_level_t) log_level = ATOMIC_VAR_INIT(JUICE_LOG_LEVEL_WARN);
+static atomic(juice_log_level_t) log_level = JUICE_LOG_LEVEL_WARN;
 
 static bool use_color(void) {
 #ifdef _WIN32
@@ -87,7 +87,7 @@ void juice_log_write(juice_log_level_t level, const char *file, int line, const 
 #if !RELEASE
 		len = snprintf(message, BUFFER_SIZE, "%s:%d: ", filename, line);
 		if (len < 0)
-			return;
+			goto __exit;
 #endif
 		if (len < BUFFER_SIZE) {
 			va_list args;
@@ -125,5 +125,9 @@ void juice_log_write(juice_log_level_t level, const char *file, int line, const 
 		fprintf(stdout, "\n");
 		fflush(stdout);
 	}
+
+#if !RELEASE
+__exit:
+#endif
 	mutex_unlock(&log_mutex);
 }

@@ -50,6 +50,7 @@ int conn_poll_recv(socket_t sock, char *buffer, size_t size, addr_record_t *src)
 int conn_poll_run(conn_registry_t *registry);
 
 static thread_return_t THREAD_CALL conn_thread_entry(void *arg) {
+	thread_set_name_self("juice poll");
 	conn_registry_t *registry = (conn_registry_t *)arg;
 	conn_poll_run(registry);
 	return (thread_return_t)0;
@@ -223,25 +224,25 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 #endif
 	}
 
+	mutex_lock(&registry->mutex);
 	for (nfds_t i = 1; i < pfds->size; ++i) {
 		struct pollfd *pfd = pfds->pfds + i;
 		if (pfd->fd == INVALID_SOCKET)
 			continue;
 
-		mutex_lock(&registry->mutex);
 		juice_agent_t *agent = registry->agents[i - 1];
 		if (!agent)
-			goto end;
+			continue;
 
 		conn_impl_t *conn_impl = agent->conn_impl;
 		if (!conn_impl || conn_impl->sock != pfd->fd || conn_impl->state != CONN_STATE_READY)
-			goto end;
+			continue;
 
 		if (pfd->revents & POLLNVAL || pfd->revents & POLLERR) {
 			JLOG_WARN("Error when polling socket");
 			agent_conn_fail(agent);
 			conn_impl->state = CONN_STATE_FINISHED;
-			goto end;
+			continue;
 		}
 
 		if (pfd->revents & POLLIN) {
@@ -258,32 +259,29 @@ int conn_poll_process(conn_registry_t *registry, pfds_record_t *pfds) {
 				}
 			}
 			if (conn_impl->state == CONN_STATE_FINISHED)
-				goto end;
+				continue;
 
 			if (ret < 0) {
 				agent_conn_fail(agent);
 				conn_impl->state = CONN_STATE_FINISHED;
-				goto end;
+				continue;
 			}
 
 			if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
 				JLOG_WARN("Agent update failed");
 				conn_impl->state = CONN_STATE_FINISHED;
-				goto end;
+				continue;
 			}
 
 		} else if (conn_impl->next_timestamp <= current_timestamp()) {
 			if (agent_conn_update(agent, &conn_impl->next_timestamp) != 0) {
 				JLOG_WARN("Agent update failed");
 				conn_impl->state = CONN_STATE_FINISHED;
-				goto end;
+				continue;
 			}
 		}
-
-	end:
-		mutex_unlock(&registry->mutex);
 	}
-
+	mutex_unlock(&registry->mutex);
 	return 0;
 }
 
@@ -303,7 +301,7 @@ int conn_poll_run(conn_registry_t *registry) {
 		JLOG_VERBOSE("Leaving poll");
 		if (ret < 0) {
 #ifdef _WIN32
-			if (ret == WSAENOTSOCK)
+			if (sockerrno == WSAENOTSOCK)
 				continue; // prepare again as the fd has been removed
 #endif
 			if (sockerrno == SEINTR || sockerrno == SEAGAIN) {
@@ -379,15 +377,15 @@ int conn_poll_interrupt(juice_agent_t *agent) {
 
 	JLOG_VERBOSE("Interrupting connections thread");
 
+	char dummy = 0;
 #ifdef _WIN32
-	if (udp_sendto_self(registry_impl->interrupt_sock, NULL, 0) < 0) {
+	if (udp_sendto_self(registry_impl->interrupt_sock, &dummy, 0) < 0) {
 		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
 			JLOG_WARN("Failed to interrupt poll by triggering socket, errno=%d", sockerrno);
 		}
 		return -1;
 	}
 #else
-	char dummy = 0;
 	if (write(registry_impl->interrupt_pipe_out, &dummy, 1) < 0 && errno != EAGAIN &&
 	    errno != EWOULDBLOCK) {
 		JLOG_WARN("Failed to interrupt poll by writing to pipe, errno=%d", errno);
@@ -414,6 +412,7 @@ int conn_poll_send(juice_agent_t *agent, const addr_record_t *dst, const char *d
 
 	int ret = udp_sendto(conn_impl->sock, data, size, dst);
 	if (ret < 0) {
+		ret = -sockerrno;
 		if (sockerrno == SEAGAIN || sockerrno == SEWOULDBLOCK)
 			JLOG_INFO("Send failed, buffer is full");
 		else if (sockerrno == SEMSGSIZE)

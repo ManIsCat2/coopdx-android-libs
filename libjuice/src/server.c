@@ -44,14 +44,17 @@
 #define MAX_RELAYED_RECORDS_COUNT 8
 #define BUFFER_SIZE 4096
 
-static char *alloc_string_copy(const char *orig) {
+static char *alloc_string_copy(const char *orig, bool *alloc_failed) {
 	if (!orig)
 		return NULL;
 
 	char *copy = malloc(strlen(orig) + 1);
-	if (!copy)
-		return NULL;
+	if (!copy) {
+		if (alloc_failed)
+			*alloc_failed = true;
 
+		return NULL;
+	}
 	strcpy(copy, orig);
 	return copy;
 }
@@ -86,6 +89,7 @@ static void delete_allocation(server_turn_alloc_t *alloc) {
 }
 
 static thread_return_t THREAD_CALL server_thread_entry(void *arg) {
+	thread_set_name_self("juice server");
 	server_run((juice_server_t *)arg);
 	return (thread_return_t)0;
 }
@@ -122,38 +126,27 @@ juice_server_t *server_create(const juice_server_config_t *config) {
 
 	mutex_init(&server->mutex, MUTEX_RECURSIVE);
 
-	server->config = *config;
-
-	if (server->config.bind_address) {
-		server->config.bind_address = alloc_string_copy(server->config.bind_address);
-		if (!server->config.bind_address) {
-			JLOG_FATAL("Memory allocation for bind address failed");
-			goto error;
-		}
-	}
-
-	if (server->config.external_address) {
-		server->config.external_address = alloc_string_copy(server->config.external_address);
-		if (!server->config.external_address) {
-			JLOG_FATAL("Memory allocation for external address failed");
-			goto error;
-		}
-	}
-
-	const char *realm =
-	    config->realm && *config->realm != '\0' ? config->realm : SERVER_DEFAULT_REALM;
-	server->config.realm = alloc_string_copy(realm);
-	if (!server->config.realm) {
-		JLOG_FATAL("Memory allocation for realm failed");
+	bool alloc_failed = false;
+	server->config.max_allocations =
+	    config->max_allocations > 0 ? config->max_allocations : SERVER_DEFAULT_MAX_ALLOCATIONS;
+	server->config.max_peers = config->max_peers;
+	server->config.bind_address = alloc_string_copy(config->bind_address, &alloc_failed);
+	server->config.external_address = alloc_string_copy(config->external_address, &alloc_failed);
+	server->config.port = config->port;
+	server->config.relay_port_range_begin = config->relay_port_range_begin;
+	server->config.relay_port_range_end = config->relay_port_range_end;
+	server->config.realm = alloc_string_copy(
+	    config->realm && *config->realm != '\0' ? config->realm : SERVER_DEFAULT_REALM,
+	    &alloc_failed);
+	if (alloc_failed) {
+		JLOG_FATAL("Memory allocation for server configuration failed");
 		goto error;
 	}
 
-	if (server->config.max_allocations == 0)
-		server->config.max_allocations = SERVER_DEFAULT_MAX_ALLOCATIONS;
-
-	server->credentials = NULL;
-
-	if (server->config.credentials_count == 0) {
+	// Don't copy credentials but process them
+	server->config.credentials = NULL;
+	server->config.credentials_count = 0;
+	if (config->credentials_count <= 0) {
 		// TURN disabled
 		JLOG_INFO("TURN relaying disabled, STUN-only mode");
 		server->allocs = NULL;
@@ -161,20 +154,23 @@ juice_server_t *server_create(const juice_server_config_t *config) {
 
 	} else {
 		// TURN enabled
-		for (int i = 0; i < server->config.credentials_count; ++i) {
-			juice_server_credentials_t *credentials = server->config.credentials + i;
+		server->allocs = calloc(server->config.max_allocations, sizeof(server_turn_alloc_t));
+		if (!server->allocs) {
+			JLOG_FATAL("Memory allocation for TURN allocation table failed");
+			goto error;
+		}
+		server->allocs_count = (int)server->config.max_allocations;
 
+		for (int i = 0; i < config->credentials_count; ++i) {
+			juice_server_credentials_t *credentials = config->credentials + i;
 			if (server->config.max_allocations < credentials->allocations_quota)
 				server->config.max_allocations = credentials->allocations_quota;
 
-			if (server_do_add_credentials(server, credentials, 0) == NULL) { // never expires
+			if (!server_do_add_credentials(server, credentials, 0)) { // never expires
 				JLOG_FATAL("Failed to add TURN credentials");
 				goto error;
 			}
 		}
-
-		server->config.credentials = NULL; // Don't copy
-		server->config.credentials_count = 0;
 
 		juice_credentials_list_t *node = server->credentials;
 		while (node) {
@@ -184,13 +180,6 @@ juice_server_t *server_create(const juice_server_config_t *config) {
 
 			node = node->next;
 		}
-
-		server->allocs = calloc(server->config.max_allocations, sizeof(server_turn_alloc_t));
-		if (!server->allocs) {
-			JLOG_FATAL("Memory allocation for TURN allocation table failed");
-			goto error;
-		}
-		server->allocs_count = (int)server->config.max_allocations;
 	}
 
 	server->config.port = udp_get_port(server->sock);
@@ -314,13 +303,13 @@ juice_credentials_list_t *server_do_add_credentials(juice_server_t *server,
 		goto error;
 	}
 
-	node->credentials = *credentials;
+	bool alloc_failed = false;
 	node->credentials.username =
-	    alloc_string_copy(node->credentials.username ? node->credentials.username : "");
+	    alloc_string_copy(credentials->username ? credentials->username : "", &alloc_failed);
 	node->credentials.password =
-	    alloc_string_copy(node->credentials.password ? node->credentials.password : "");
-
-	if (!node->credentials.username || !node->credentials.password) {
+	    alloc_string_copy(credentials->password ? credentials->password : "", &alloc_failed);
+	node->credentials.allocations_quota = credentials->allocations_quota;
+	if (alloc_failed) {
 		JLOG_ERROR("Memory allocation for TURN credentials failed");
 		goto error;
 	}
@@ -489,6 +478,21 @@ int server_forward(juice_server_t *server, server_turn_alloc_t *alloc) {
 		}
 		addr_unmap_inet6_v4mapped((struct sockaddr *)&record.addr, &record.len);
 
+		// RFC 5766 8. Permissions:
+		// When a UDP datagram arrives at the relayed transport address for the allocation, the
+		// server extracts the source IP address from the IP header. The server then compares this
+		// address with the IP address associated with each permission in the list of permissions
+		// for the allocation. If no match is found, relaying is not permitted, and the server
+		// silently discards the UDP datagram.
+		if (!turn_has_permission(&alloc->map, &record)) {
+			if (JLOG_DEBUG_ENABLED) {
+				char record_str[ADDR_MAX_STRING_LEN];
+				addr_record_to_string(&record, record_str, ADDR_MAX_STRING_LEN);
+				JLOG_DEBUG("No permission for remote address %s, discarding", record_str);
+			}
+			return -1;
+		}
+
 		uint16_t channel;
 		if (turn_get_bound_channel(&alloc->map, &record, &channel)) {
 			// Use ChannelData
@@ -514,7 +518,8 @@ int server_forward(juice_server_t *server, server_turn_alloc_t *alloc) {
 			memset(&msg, 0, sizeof(msg));
 			msg.msg_class = STUN_CLASS_INDICATION;
 			msg.msg_method = STUN_METHOD_DATA;
-			msg.peer = record;
+			msg.peers_size = 1;
+			msg.peers[0] = record;
 			msg.data = buffer;
 			msg.data_size = len;
 			juice_random(msg.transaction_id, STUN_TRANSACTION_ID_SIZE);
@@ -568,7 +573,8 @@ int server_interrupt(juice_server_t *server) {
 		return -1;
 	}
 
-	if (udp_sendto_self(server->sock, NULL, 0) < 0) {
+	char dummy = 0; // Some C libraries might error out on NULL pointers
+	if (udp_sendto_self(server->sock, &dummy, 0) < 0) {
 		if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
 			JLOG_WARN("Failed to interrupt thread by triggering socket, errno=%d", sockerrno);
 			mutex_unlock(&server->mutex);
@@ -988,9 +994,15 @@ int server_process_turn_create_permission(juice_server_t *server, const stun_mes
 
 	JLOG_DEBUG("Processing STUN CreatePermission request");
 
-	if (!msg->peer.len) {
+	// RFC 5766 9.2. Receiving a CreatePermission Request:
+	// The CreatePermission request MUST contain at least one XOR-PEER-ADDRESS attribute and MAY
+	// contain multiple such attributes. If no such attribute exists, or if any of these attributes
+	// are invalid, then a 400 (Bad Request) error is returned.
+	if (!msg->peers_size) {
 		JLOG_WARN("Missing peer address in TURN CreatePermission request");
-		return -1;
+		return server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method,
+		                                400, // Bad request
+		                                credentials);
 	}
 
 	server_turn_alloc_t *alloc = find_allocation(server->allocs, server->allocs_count, src, false);
@@ -1005,10 +1017,13 @@ int server_process_turn_create_permission(juice_server_t *server, const stun_mes
 		                                credentials);
 	}
 
-	if (!turn_set_permission(&alloc->map, msg->transaction_id, &msg->peer, PERMISSION_LIFETIME)) {
-		server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method, 500,
-		                         credentials);
-		return -1;
+	for (size_t i = 0; i < msg->peers_size; ++i) {
+		const addr_record_t *peer = msg->peers + i;
+		if (!turn_set_permission(&alloc->map, msg->transaction_id, peer, PERMISSION_LIFETIME)) {
+			server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method, 500,
+			                         credentials);
+			return -1;
+		}
 	}
 
 	stun_message_t ans;
@@ -1030,13 +1045,17 @@ int server_process_turn_channel_bind(juice_server_t *server, const stun_message_
 
 	JLOG_DEBUG("Processing STUN ChannelBind request");
 
-	if (!msg->peer.len) {
+	if (!msg->peers_size) {
 		JLOG_WARN("Missing peer address in TURN ChannelBind request");
-		return -1;
+		return server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method,
+		                                400, // Bad request
+		                                credentials);
 	}
 	if (!msg->channel_number) {
 		JLOG_WARN("Missing channel number in TURN ChannelBind request");
-		return -1;
+		return server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method,
+		                                400, // Bad request
+		                                credentials);
 	}
 
 	server_turn_alloc_t *alloc = find_allocation(server->allocs, server->allocs_count, src, false);
@@ -1059,7 +1078,17 @@ int server_process_turn_channel_bind(juice_server_t *server, const stun_message_
 		                                credentials);
 	}
 
-	if (!turn_bind_channel(&alloc->map, &msg->peer, msg->transaction_id, channel, BIND_LIFETIME)) {
+	// RFC 5766 11.3. Receiving a ChannelBind Response
+	// When the client receives a ChannelBind success response, it updates its data structures to
+	// record that the channel binding is now active. It also updates its data structures to record
+	// that the corresponding permission has been installed or refreshed.
+	const addr_record_t *peer = msg->peers;
+	if (!turn_bind_channel(&alloc->map, peer, msg->transaction_id, channel, BIND_LIFETIME)) {
+		server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method, 500,
+		                         credentials);
+		return -1;
+	}
+	if (!turn_set_permission(&alloc->map, msg->transaction_id, peer, PERMISSION_LIFETIME)) {
 		server_answer_stun_error(server, msg->transaction_id, src, msg->msg_method, 500,
 		                         credentials);
 		return -1;
@@ -1087,7 +1116,7 @@ int server_process_turn_send(juice_server_t *server, const stun_message_t *msg,
 		JLOG_WARN("Missing data in TURN Send indication");
 		return -1;
 	}
-	if (!msg->peer.len) {
+	if (!msg->peers_size) {
 		JLOG_WARN("Missing peer address in TURN Send indication");
 		return -1;
 	}
@@ -1098,14 +1127,19 @@ int server_process_turn_send(juice_server_t *server, const stun_message_t *msg,
 		return -1;
 	}
 
-	if (!turn_has_permission(&alloc->map, &msg->peer)) {
-		JLOG_WARN("No permission for peer address");
+	const addr_record_t *peer = msg->peers;
+	if (!turn_has_permission(&alloc->map, peer)) {
+		if (JLOG_WARN_ENABLED) {
+			char peer_str[ADDR_MAX_STRING_LEN];
+			addr_record_to_string(peer, peer_str, ADDR_MAX_STRING_LEN);
+			JLOG_WARN("No permission for peer address %s", peer_str);
+		}
 		return -1;
 	}
 
 	JLOG_VERBOSE("Forwarding datagram to peer, size=%zu", msg->data_size);
 
-	int ret = udp_sendto(alloc->sock, msg->data, msg->data_size, &msg->peer);
+	int ret = udp_sendto(alloc->sock, msg->data, msg->data_size, peer);
 	if (ret < 0 && sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK)
 		JLOG_WARN("Forwarding failed, errno=%d", sockerrno);
 

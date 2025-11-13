@@ -42,6 +42,10 @@ static int parse_sdp_line(const char *line, ice_description_t *description) {
 		sscanf(arg, "%256s", description->ice_pwd);
 		return 0;
 	}
+	if (match_prefix(line, "a=ice-lite", &arg)) {
+		description->ice_lite = true;
+		return 0;
+	}
 	if (match_prefix(line, "a=end-of-candidates", &arg)) {
 		description->finished = true;
 		return 0;
@@ -96,6 +100,7 @@ static int parse_sdp_candidate(const char *line, ice_candidate_t *candidate) {
 
 int ice_parse_sdp(const char *sdp, ice_description_t *description) {
 	memset(description, 0, sizeof(*description));
+	description->ice_lite = false;
 	description->candidates_count = 0;
 	description->finished = false;
 
@@ -105,7 +110,9 @@ int ice_parse_sdp(const char *sdp, ice_description_t *description) {
 		if (*sdp == '\n') {
 			if (size) {
 				buffer[size++] = '\0';
-				parse_sdp_line(buffer, description);
+				if (parse_sdp_line(buffer, description) == ICE_PARSE_ERROR)
+					return ICE_PARSE_ERROR;
+
 				size = 0;
 			}
 		} else if (*sdp != '\r' && size + 1 < BUFFER_SIZE) {
@@ -118,7 +125,13 @@ int ice_parse_sdp(const char *sdp, ice_description_t *description) {
 	JLOG_DEBUG("Parsed remote description: ufrag=\"%s\", pwd=\"%s\", candidates=%d",
 	           description->ice_ufrag, description->ice_pwd, description->candidates_count);
 
-	return *description->ice_ufrag && *description->ice_pwd ? 0 : ICE_PARSE_ERROR;
+	if (*description->ice_ufrag == '\0')
+		return ICE_PARSE_MISSING_UFRAG;
+
+	if (*description->ice_pwd == '\0')
+		return ICE_PARSE_MISSING_PWD;
+
+	return 0;
 }
 
 int ice_parse_candidate_sdp(const char *line, ice_candidate_t *candidate) {
@@ -137,6 +150,7 @@ int ice_create_local_description(ice_description_t *description) {
 	memset(description, 0, sizeof(*description));
 	juice_random_str64(description->ice_ufrag, 4 + 1);
 	juice_random_str64(description->ice_pwd, 22 + 1);
+	description->ice_lite = false;
 	description->candidates_count = 0;
 	description->finished = false;
 	JLOG_DEBUG("Created local description: ufrag=\"%s\", pwd=\"%s\"", description->ice_ufrag,
@@ -169,7 +183,9 @@ int ice_resolve_candidate(ice_candidate_t *candidate, ice_resolve_mode_t mode) {
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_DGRAM;
 	hints.ai_protocol = IPPROTO_UDP;
+#ifdef AI_ADDRCONFIG
 	hints.ai_flags = AI_ADDRCONFIG;
+#endif
 	if (mode != ICE_RESOLVE_MODE_LOOKUP)
 		hints.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
 	struct addrinfo *ai_list = NULL;
@@ -256,6 +272,9 @@ int ice_generate_sdp(const ice_description_t *description, char *buffer, size_t 
 		if (i == 0) {
 			ret = snprintf(begin, end - begin, "a=ice-ufrag:%s\r\na=ice-pwd:%s\r\n",
 			               description->ice_ufrag, description->ice_pwd);
+			if (description->ice_lite)
+				ret = snprintf(begin, end - begin, "a=ice-lite\r\n");
+
 		} else if (i < description->candidates_count + 1) {
 			const ice_candidate_t *candidate = description->candidates + i - 1;
 			if (candidate->type == ICE_CANDIDATE_TYPE_UNKNOWN ||
@@ -397,4 +416,15 @@ uint32_t ice_compute_priority(ice_candidate_type_t type, int family, int compone
 
 	p += 256 - CLAMP(component, 1, 256);
 	return p;
+}
+
+bool ice_is_valid_string(const char *str) {
+	if (!str)
+		return false;
+
+	for (size_t i = 0; i < strlen(str); ++i)
+		if (!isalpha(str[i]) && !isdigit(str[i]) && str[i] != '+' && str[i] != '/')
+			return false;
+
+	return true;
 }

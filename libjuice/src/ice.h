@@ -47,6 +47,7 @@ typedef struct ice_candidate {
 typedef struct ice_description {
 	char ice_ufrag[256 + 1]; // 4 to 256 characters
 	char ice_pwd[256 + 1];   // 22 to 256 characters
+	bool ice_lite;
 	ice_candidate_t candidates[ICE_MAX_CANDIDATES_COUNT];
 	int candidates_count;
 	bool finished;
@@ -76,6 +77,8 @@ typedef enum ice_resolve_mode {
 
 #define ICE_PARSE_ERROR -1
 #define ICE_PARSE_IGNORED -2
+#define ICE_PARSE_MISSING_UFRAG -3
+#define ICE_PARSE_MISSING_PWD -4
 
 int ice_parse_sdp(const char *sdp, ice_description_t *description);
 int ice_parse_candidate_sdp(const char *line, ice_candidate_t *candidate);
@@ -97,5 +100,7 @@ int ice_update_candidate_pair(ice_candidate_pair_t *pair, bool is_controlling);
 int ice_candidates_count(const ice_description_t *description, ice_candidate_type_t type);
 
 uint32_t ice_compute_priority(ice_candidate_type_t type, int family, int component, int index);
+
+bool ice_is_valid_string(const char *str);
 
 #endif
